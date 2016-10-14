@@ -20,7 +20,78 @@
 #include "../Core/ExecutionContext.hppml"
 #include "VectorDataManager.hppml"
 
-class VectorDataMappedMemoryImpl {
+@type BigvecOrPageId = 
+    -| Bigvec of Fora::BigVectorId bigvec
+    -| Page of Fora::PageId page
+    ;
+
+@type PhysicalMemoryAllocation = 
+    BigvecOrPageId objectId,
+    IntegerRange range,
+    size_t elementSize
+    ;
+
+@type PhysicalMemoryDirectPagePlacement = 
+    Fora::PageId page,
+    IntegerRange pageDataSubset,
+    PhysicalMemoryAllocation allocation,
+    IntegerRange rangeWithinPhysical
+    ;
+
+macro_defineCppmlComparisonOperators(PhysicalMemoryAllocation);
+macro_defineCppmlComparisonOperators(BigvecOrPageId);
+
+/**************
+
+This class tracks the relationship between blocks of physical memory we've allocated
+in shared memory pools, the data we have placed in them, and the mappings we've applied.
+
+This class takes care of several things:
+    * we need to keep track of which physical memory holds what data currently
+    * we need to be able to tell in what locations the vector data we've already
+        placed lives so we can get it back if need be.
+    * when new vector data shows up, we need to figure out an ideal place to store it.
+        this means looping over the various bigvecs that could hold it and seeing if
+        we have storage allocated already for it.
+    * when we want to map data for an address, we want to see if we already have storage
+        for mappable for that page. if we can map it directly that's great, but we may
+        need to make an extra copy of the data.
+
+***************/
+
+class PageDataPlacements {
+public:
+    //we created physical memory to back a given bigvec. This might get shared with multiple
+    //mapping targets
+    void physicalMemoryAllocated(PhysicalMemoryAllocation allocation, uint8_t* actualAddress);
+
+    //we deallocated some physical memory
+    void physicalMemoryDeallocated(PhysicalMemoryAllocation allocation);
+
+    //a process is copying something into some physical memory, so we definitely can't delete it.
+    void markPhysicalMemoryInUse(PhysicalMemoryAllocation allocation, IntegerRange range);
+
+    //indicate that we are no longer directly copying data into a physical location
+    void markPhysicalMemoryNoLongerInUse(PhysicalMemoryAllocation allocation, IntegerRange range);
+
+    //we wrote some page data into a block of physical memory and need to remember that that
+    //data is populated
+    void pageDataPlacedInPhysicalMemory(Fora::PageId page, IntegerSequence pageData, PhysicalMemoryAllocation allocation, IntegerRange rangeWithinPhysical);
+
+    //we mapped a block of physical memory into a bigvec target
+    void physicalMemoryMapped(PhysicalMemoryAllocation allocation, IntegerRange rangeInAllocation, BigvecOrPageId target, IntegerRange rangeInTarget);
+
+    //we removed a mapping
+    void physicalMemoryUnmapped(PhysicalMemoryAllocation allocation, IntegerRange rangeInAllocation, BigvecOrPageId target, IntegerRange rangeInTarget);
+
+    //can we take a portion of 'inPage' and find a physically located place for it already?
+    Nullable<PhysicalMemoryPagePlacement> hasPhysicalLocationToCopySubsetOf(const Fora::PageId& inPage, IntegerRange valueRange, uint64_t homogenousStride);
+private:
+};
+
+
+
+class VectorDataMappedMemoryImpl : public PolymorphicSharedPtrBase<VectorDataMappedMemoryImpl> {
 public:
     VectorDataMappedMemoryImpl(
                 PolymorphicSharedPtr<CallbackScheduler> inCallbackScheduler,
@@ -58,27 +129,155 @@ public:
         return nullptr;
         }
 
+    uint8_t* allocateAddressForPage(const Fora::PageId& inPage, int64_t valueCount, int64_t valueStride)
+        {
+        boost::mutex::scoped_lock lock(mMutex);
+
+        mPageAddressRefcounts[inPage]++;
+        
+        if (mPageAddresses.hasKey(id))
+            return mPageAddresses.getValue(id);
+
+        auto ptr = mMemoryRegions.allocateMappableRegion(mMemoryRegions.roundUpToPageSize(valueCount * valueStride));
+
+        mPageAddresses.set(id, ptr);
+
+        mPageAddressSizeAndStrides[inPage] = make_pair(valueCount, valueStride);
+
+        return ptr;
+        }
+
+    void deallocateAddressForPage(const Fora::PageId& inPage)
+        {
+        boost::mutex::scoped_lock lock(mMutex);
+
+        mPageAddressRefcounts[inPage]--;
+
+        if (mPageAddressRefcounts[inPage] == 0)
+            {
+            mPageAddressRefcounts.erase(inPage);
+            mMemoryRegions.releaseMappableRegion(mPageAddresses[inPage]);
+            mPageAddresses.drop(inPage);
+            mPageAddressSizeAndStrides.erase(inPage);
+            }
+        }
+
     uint8_t* addressForBigvec(const Fora::BigVectorId& id)
         {
-        return nullptr;
+        boost::mutex::scoped_lock lock(mMutex);
+
+        if (id.jor().size() != 1 || !id.jor()[0].type() || !id.jor()[0].type()->isPOD())
+            return nullptr;
+
+        if (mBigvecAddresses.hasKey(id))
+            return mBigvecAddresses.getValue(id);
+
+        uint64_t bytecount = mMemoryRegions.roundUpToPageSize(id.size() * id.jor()[0].type()->size());
+
+        uint8_t* ptr = mMemoryRegions.allocateMappableRegion(bytecount);
+        if (!ptr)
+            return nullptr;
+
+        mBigvecAddresses.set(id, ptr);
+
+        return ptr;
         }
 
     void bigvecDroppedAcrossEntireSystem(const Fora::BigVectorId& id)
         {
+        boost::mutex::scoped_lock lock(mMutex);
+
+        if (!mBigvecAddresses.hasKey(id))
+            return;
+
+        mMemoryRegions.releaseMappableRegion(it->second);
+
+        mBigvecAddresses.drop(it);
         }
    
     bool allocatePageData(
-                    const VectorDataID& inPage, 
+                    const Fora::PageId& inPage, 
                     IntegerRange valueRange,
                     uint64_t homogenousStride,
-                    boost::function<void (uint8_t*)> inPopulateFunc
+                    boost::function<void (uint8_t*, IntegerRange)> inPopulateFunc
                     )
         {
-        return false;
+        uint8_t* addr;
+        uint64_t bytecount;
+
+            {
+            boost::mutex::scoped_lock lock(mMutex);
+
+            //see if there is a natural place to copy this data to already mapped
+            auto targetSlice = mPageDataPlacement.hasPhysicalLocationToCopySubsetOf(inPage, valueRange, homogenousStride);
+
+            if (targetSlice)
+                {
+                mPageDataPlacement.markPhysicalMemoryInUse(targetSlice->allocation(), targetSlice->rangeWithinPhysical());
+
+                //do copy op
+                lock.unlock();
+                inPopulateFunc(...);
+                lock.lock();
+
+                mPageDataPlacement.markPhysicalMemoryNoLongerInUse(targetSlice->allocation(), targetSlice->rangeWithinPhysical());
+
+                //indicate the mapping succeeded
+                
+                }
+
+            bytecount = mMemoryRegions.roundUpToPageSize(valueRange.size() * homogenousStride);
+
+            if (!mVDMM->allocateExternalSharedMemory(bytecount))
+                return false;
+
+            addr = mMemoryRegions.allocateSharedRegion(bytecount);
+
+            if (!addr)
+                {
+                mVDMM->releaseExternalSharedMemory(bytecount);
+                return false;
+                }
+            }
+
+        //inPopulateFunc(addr);
+
+            {
+            boost::mutex::scoped_lock lock(mMutex);
+
+            PageDataAllocation alloc(inPage, valueRange, homogenousStride);
+
+            if (mPageAllocations.find(alloc) != mPageAllocations.end())
+                {
+                mMemoryRegions.releaseSharedRegion(addr);
+                mVDMM->releaseExternalSharedMemory(bytecount);
+
+                return false;
+                }
+
+            mPageAllocations[alloc] = addr;
+            mVecsToAllocs.insert(alloc.vec(), alloc);
+            }
+
+        return true;
         }
 
-    void deallocatePageData(const VectorDataID& inPage)
+    void deallocatePageData(const Fora::PageId& inPage)
         {
+        boost::mutex::scoped_lock lock(mMutex);
+
+        for (auto alloc: mVecsToAllocs.getValues(inPage))
+            {
+            auto it = mPageAllocations.find(alloc);
+            lassert(it != mPageAllocations.end());
+
+            mMemoryRegions.releaseSharedRegion(it->second);
+            mVDMM->releaseExternalSharedMemory(alloc.size());
+
+            mPageAllocations.erase(it);
+            }
+
+        mVecsToAllocs.dropKey(inPage);
         }
 
     EventBroadcaster<VectorDataMappedMemory::ThreadBlockedEvent>& getThreadBlockedEvent()
@@ -88,6 +287,17 @@ public:
 
 private:
     boost::mutex mMutex;
+
+    PageDataPlacements mPageDataPlacement;
+
+    //client-facing mapping targets for bigvecs
+    MapWithIndex<Fora::BigVectorId, uint8_t*> mBigvecAddresses;
+
+    //client-facing mapping targets for individual pages, along with refcounts and other
+    //infor for said.
+    MapWithIndex<Fora::PageId, uint8_t*> mPageAddresses;
+    map<Fora::PageId, int64_t> mPageAddressRefcounts;
+    map<Fora::PageId, pair<int64_t, int64_t> > mPageAddressSizeAndStrides;
 
     EventBroadcaster<VectorDataMappedMemory::ThreadBlockedEvent> mThreadBlockedEvent;
 
@@ -119,23 +329,33 @@ uint8_t* VectorDataMappedMemory::addressForBigvec(const Fora::BigVectorId& id)
     return mImpl->addressForBigvec(id);
     }
 
+uint8_t* VectorDataMappedMemory::allocateAddressForPage(const Fora::PageId& inPage, int64_t valueCount, int64_t valueStride)
+    {
+    return mImpl->allocateAddressForPage(id, valueCount, valueStride);
+    }
+
+void VectorDataMappedMemory::deallocateAddressForPage(const Fora::PageId& inPage)
+    {
+    mImpl->deallocateAddressForPage(inPage);
+    }
+
 void VectorDataMappedMemory::bigvecDroppedAcrossEntireSystem(const Fora::BigVectorId& id)
     {
     mImpl->addressForBigvec(id);
     }
 
 bool VectorDataMappedMemory::allocatePageData(
-                const VectorDataID& inPage, 
+                const Fora::PageId& inPage, 
                 IntegerRange valueRange,
                 uint64_t homogenousStride,
-                boost::function<void (uint8_t*)> inPopulateFunc
+                boost::function<void (uint8_t*, IntegerRange)> inPopulateFunc
                 )
     {
     return mImpl->allocatePageData(inPage, valueRange, homogenousStride, inPopulateFunc);
     }
 
 void VectorDataMappedMemory::visitPageData(
-                const VectorDataID& inPage,
+                const Fora::PageId& inPage,
                 boost::function<void (uint8_t*, IntegerRange)> inVisitFunc
                 )
     {
@@ -143,7 +363,7 @@ void VectorDataMappedMemory::visitPageData(
     }
 
 
-void VectorDataMappedMemory::deallocatePageData(const VectorDataID& inPage)
+void VectorDataMappedMemory::deallocatePageData(const Fora::PageId& inPage)
     {
     mImpl->deallocatePageData(inPage);
     }

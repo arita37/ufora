@@ -61,6 +61,13 @@ public:
 
     static OnDemandMemoryRegions* curRegionPtr();
 
+    uint64_t pageSize() const;
+
+    uint64_t roundUpToPageSize(uint64_t in) const
+        {
+        return pageSize() * ((uint64_t)((in-1) / pageSize()) + 1);
+        }
+
     //allocate a shared region. This is backed by actual memory.
     //returns nullptr if we can't allocate more space.
     uint8_t* allocateSharedRegion(uint64_t bytecount);
